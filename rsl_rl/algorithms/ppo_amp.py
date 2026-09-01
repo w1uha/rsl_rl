@@ -45,6 +45,8 @@ class PPOAMP(PPO):
         symmetry_cfg: dict | None = None,
         # AMP parameters
         amp_cfg: dict | None = None,
+        # Auxiliary next-foothold prediction parameters
+        foothold_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -116,6 +118,7 @@ class PPOAMP(PPO):
         # Storage for AMP discriminator observations
         self.disc_obs_buffer: CircularBuffer = disc_obs_buffer
         self.disc_demo_obs_buffer: CircularBuffer = disc_demo_obs_buffer
+        self.foothold_cfg = foothold_cfg
         
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -135,8 +138,68 @@ class PPOAMP(PPO):
         # Store the un-normalized disc obs and disc demo obs into buffers
         self.disc_obs_buffer.append(disc_obs)
         self.disc_demo_obs_buffer.append(disc_demo_obs)
+        foothold_cfg = getattr(self, "foothold_cfg", None)
+        foothold_step = self.storage.step if foothold_cfg is not None else None
+        previous_foothold_state = None
+        if foothold_cfg is not None:
+            previous_foothold_state = self.transition.observations[foothold_cfg["supervision_group"]]
+
         # Call the parent class method with the new rewards
         super().process_env_step(obs, self.rewards_lerp, dones, extras)
+
+        if foothold_step is not None and previous_foothold_state is not None:
+            self._backfill_foothold_targets(
+                step=foothold_step,
+                previous_state=previous_foothold_state,
+                current_state=obs[self.foothold_cfg["supervision_group"]],
+                dones=dones,
+            )
+
+    def _backfill_foothold_targets(
+        self,
+        step: int,
+        previous_state: torch.Tensor,
+        current_state: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> None:
+        """Backfill labels for the contiguous airborne segment ending in a touchdown."""
+        cfg = self.foothold_cfg
+        supervision = self.storage.observations[cfg["supervision_group"]][: step + 1]
+        targets = self.storage.observations[cfg["target_group"]]
+        target_valid = self.storage.observations[cfg["valid_group"]]
+        previous_contacts = previous_state[:, 8:10] > 0.5
+        current_contacts = current_state[:, 8:10] > 0.5
+        touchdowns = (~previous_contacts) & current_contacts & (~dones.bool()).unsqueeze(-1)
+
+        time_indices = torch.arange(step + 1, device=self.device)
+        touchdown_times = (step - time_indices + 1).to(torch.float32) * cfg["step_dt"]
+
+        for foot_index in range(2):
+            touchdown_envs = touchdowns[:, foot_index]
+            if not touchdown_envs.any():
+                continue
+
+            airborne = supervision[..., 8 + foot_index] < 0.5
+            contiguous_airborne = torch.flip(
+                torch.cumprod(torch.flip(airborne.to(torch.int32), dims=[0]), dim=0),
+                dims=[0],
+            ).bool()
+            label_mask = contiguous_airborne & touchdown_envs.unsqueeze(0)
+
+            root_xy = supervision[..., :2]
+            cos_yaw = supervision[..., 2]
+            sin_yaw = supervision[..., 3]
+            touchdown_xy = current_state[:, 4 + 2 * foot_index : 6 + 2 * foot_index]
+            delta_xy = touchdown_xy.unsqueeze(0) - root_xy
+            local_x = cos_yaw * delta_xy[..., 0] + sin_yaw * delta_xy[..., 1]
+            local_y = -sin_yaw * delta_xy[..., 0] + cos_yaw * delta_xy[..., 1]
+
+            target_offset = 3 * foot_index
+            targets[: step + 1, :, target_offset][label_mask] = local_x[label_mask]
+            targets[: step + 1, :, target_offset + 1][label_mask] = local_y[label_mask]
+            expanded_times = touchdown_times.unsqueeze(1).expand_as(local_x)
+            targets[: step + 1, :, target_offset + 2][label_mask] = expanded_times[label_mask]
+            target_valid[: step + 1, :, foot_index][label_mask] = 1.0
         
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
@@ -151,6 +214,8 @@ class PPOAMP(PPO):
         mean_disc_grad_penalty = 0
         mean_disc_score = 0
         mean_disc_demo_score = 0
+        mean_foothold_loss = 0 if self.foothold_cfg is not None else None
+        foothold_valid_samples = 0
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -278,6 +343,25 @@ class PPOAMP(PPO):
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            if self.foothold_cfg is not None:
+                prediction = self.policy.foothold_prediction[:original_batch_size]
+                target = obs_batch[self.foothold_cfg["target_group"]][:original_batch_size]
+                valid = obs_batch[self.foothold_cfg["valid_group"]][:original_batch_size]
+                scales = prediction.new_tensor(self.foothold_cfg["target_scales"]).repeat(2)
+                element_loss = torch.nn.functional.smooth_l1_loss(
+                    prediction,
+                    target / scales,
+                    reduction="none",
+                )
+                valid_elements = valid.repeat_interleave(3, dim=-1)
+                valid_count = valid_elements.sum()
+                if valid_count > 0:
+                    foothold_loss = (element_loss * valid_elements).sum() / valid_count
+                    foothold_valid_samples += int(valid.sum().item())
+                else:
+                    foothold_loss = prediction.sum() * 0.0
+                loss += self.foothold_cfg["loss_coef"] * foothold_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -413,6 +497,8 @@ class PPOAMP(PPO):
                 disc_updates_done += 1
 
             mini_batch_idx += 1
+            if mean_foothold_loss is not None:
+                mean_foothold_loss += foothold_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -429,6 +515,8 @@ class PPOAMP(PPO):
         if disc_updates_done > 0:
             mean_disc_loss /= disc_updates_done
             mean_disc_grad_penalty /= disc_updates_done
+        if mean_foothold_loss is not None:
+            mean_foothold_loss /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -447,5 +535,8 @@ class PPOAMP(PPO):
         loss_dict["amp/disc_grad_penalty"] = mean_disc_grad_penalty
         loss_dict["amp/disc_score"] = mean_disc_score
         loss_dict["amp/disc_demo_score"] = mean_disc_demo_score
+        if mean_foothold_loss is not None:
+            loss_dict["foothold/loss"] = mean_foothold_loss
+            loss_dict["foothold/valid_samples"] = foothold_valid_samples / num_updates
 
         return loss_dict

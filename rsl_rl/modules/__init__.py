@@ -6,6 +6,7 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
+from .actor_critic_foothold import ActorCriticFoothold
 from .actor_critic_cnn import ActorCriticCNN
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
@@ -16,6 +17,7 @@ from .amp import AMPDiscriminator, resolve_amp_config
 
 __all__ = [
     "ActorCritic",
+    "ActorCriticFoothold",
     "ActorCriticCNN",
     "ActorCriticRecurrent",
     "RandomNetworkDistillation",
