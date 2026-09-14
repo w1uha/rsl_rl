@@ -26,6 +26,25 @@ def test_foothold_actor_shapes() -> None:
     assert policy.foothold_prediction.shape == (8, 6)
 
 
+def test_foothold_actor_is_torchscript_compatible() -> None:
+    actor = ActorCriticFoothold(
+        TensorDict(
+            {
+                "policy": torch.randn(1, 100),
+                "critic": torch.randn(1, 120),
+            },
+            batch_size=[1],
+        ),
+        {"policy": ["policy"], "critic": ["critic"]},
+        29,
+        actor_hidden_dims=[512, 512, 256, 128],
+        critic_hidden_dims=[512, 512, 256, 128],
+    ).actor
+
+    scripted_actor = torch.jit.script(actor)
+    assert scripted_actor(torch.randn(2, 100)).shape == (2, 29)
+
+
 def test_touchdown_backfills_contiguous_airborne_segment() -> None:
     algorithm = object.__new__(PPOAMP)
     algorithm.device = "cpu"

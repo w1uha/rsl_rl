@@ -14,6 +14,86 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.modules.amp import LossType
 
 
+def _rasterize_rectangles(
+    center_x: torch.Tensor,
+    center_y: torch.Tensor,
+    yaw: torch.Tensor,
+    length: torch.Tensor,
+    width: torch.Tensor,
+    local_size: tuple[float, float],
+    resolution: float,
+) -> torch.Tensor:
+    """Rasterize one oriented rectangle per sample into flattened local grids."""
+    rows = round(local_size[0] / resolution)
+    cols = round(local_size[1] / resolution)
+    x = (torch.arange(rows, device=center_x.device) + 0.5) * resolution - 0.5 * local_size[0]
+    y = (torch.arange(cols, device=center_x.device) + 0.5) * resolution - 0.5 * local_size[1]
+    grid_x, grid_y = torch.meshgrid(x, y, indexing="ij")
+    dx = grid_x.unsqueeze(0) - center_x[:, None, None]
+    dy = grid_y.unsqueeze(0) - center_y[:, None, None]
+    cos_yaw = torch.cos(yaw)[:, None, None]
+    sin_yaw = torch.sin(yaw)[:, None, None]
+    rect_x = cos_yaw * dx + sin_yaw * dy
+    rect_y = -sin_yaw * dx + cos_yaw * dy
+    occupied = (rect_x.abs() <= 0.5 * length[:, None, None]) & (
+        rect_y.abs() <= 0.5 * width[:, None, None]
+    )
+    return occupied.to(dtype=center_x.dtype).flatten(start_dim=1)
+
+
+def _fill_non_overlapping_grid_regions(
+    grid: torch.Tensor,
+    density_range: tuple[float, float],
+    rectangle_rows_range: tuple[int, int],
+    rectangle_cols_range: tuple[int, int],
+    forbidden: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fill local grids with non-overlapping axis-aligned rectangular regions."""
+    batch_size, rows, cols = grid.shape
+    device = grid.device
+    target_cells = torch.empty(batch_size, device=device).uniform_(*density_range)
+    target_cells = torch.round(target_cells * rows * cols).to(torch.long)
+    occupied_cells = grid.bool().sum(dim=(1, 2))
+    blocked = grid.bool() if forbidden is None else grid.bool() | forbidden.bool()
+    max_rectangle_cells = rectangle_rows_range[1] * rectangle_cols_range[1]
+    max_attempts = int(target_cells.max().item()) + 4 * max_rectangle_cells
+    batch_index = torch.arange(batch_size, device=device)[:, None]
+    row_offset = torch.arange(rectangle_rows_range[1], device=device)[None, :, None]
+    col_offset = torch.arange(rectangle_cols_range[1], device=device)[None, None, :]
+
+    for _ in range(max_attempts):
+        active = occupied_cells < target_cells
+        if not active.any():
+            break
+        height = torch.randint(rectangle_rows_range[0], rectangle_rows_range[1] + 1, (batch_size,), device=device)
+        width = torch.randint(rectangle_cols_range[0], rectangle_cols_range[1] + 1, (batch_size,), device=device)
+        start_row = (torch.rand(batch_size, device=device) * (rows - height + 1)).to(torch.long)
+        start_col = (torch.rand(batch_size, device=device) * (cols - width + 1)).to(torch.long)
+        cell_mask = (row_offset < height[:, None, None]) & (col_offset < width[:, None, None])
+        cell_rows = start_row[:, None, None] + row_offset
+        cell_cols = start_col[:, None, None] + col_offset
+        flat_indices = (cell_rows * cols + cell_cols).flatten(start_dim=1).clamp(0, rows * cols - 1)
+        cell_mask = cell_mask.flatten(start_dim=1)
+        conflicts = torch.gather(blocked.flatten(start_dim=1), 1, flat_indices) & cell_mask
+        accepted = active & (~conflicts.any(dim=1))
+        write_mask = accepted[:, None] & cell_mask
+        expanded_batch = batch_index.expand_as(flat_indices)
+        grid.flatten(start_dim=1)[expanded_batch[write_mask], flat_indices[write_mask]] = 1.0
+        blocked.flatten(start_dim=1)[expanded_batch[write_mask], flat_indices[write_mask]] = True
+        occupied_cells += accepted.to(torch.long) * height * width
+    return grid
+
+
+def _replace_grid_history(observations: torch.Tensor, grid: torch.Tensor, history_length: int) -> None:
+    """Replace the trailing term-major occupancy-grid history in place."""
+    grid_history_size = grid.shape[-1] * history_length
+    if observations.shape[-1] < grid_history_size:
+        raise ValueError(
+            f"Grid history ({grid_history_size}) exceeds observation size ({observations.shape[-1]})."
+        )
+    observations[..., -grid_history_size:] = grid.repeat(1, history_length)
+
+
 class PPOAMP(PPO):
 
     policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN
@@ -47,6 +127,8 @@ class PPOAMP(PPO):
         amp_cfg: dict | None = None,
         # Auxiliary next-foothold prediction parameters
         foothold_cfg: dict | None = None,
+        # Counterfactual occupancy-grid augmentation parameters
+        counterfactual_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -119,6 +201,8 @@ class PPOAMP(PPO):
         self.disc_obs_buffer: CircularBuffer = disc_obs_buffer
         self.disc_demo_obs_buffer: CircularBuffer = disc_demo_obs_buffer
         self.foothold_cfg = foothold_cfg
+        self.counterfactual_cfg = counterfactual_cfg
+        self._counterfactual_samples: list[dict] = []
         
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -144,6 +228,15 @@ class PPOAMP(PPO):
         if foothold_cfg is not None:
             previous_foothold_state = self.transition.observations[foothold_cfg["supervision_group"]]
 
+        counterfactual_cfg = self.counterfactual_cfg
+        if counterfactual_cfg is not None:
+            self._collect_counterfactual_samples(
+                previous_observations=self.transition.observations,
+                actions=self.transition.actions,
+                current_observations=obs,
+                dones=dones,
+            )
+
         # Call the parent class method with the new rewards
         super().process_env_step(obs, self.rewards_lerp, dones, extras)
 
@@ -154,6 +247,148 @@ class PPOAMP(PPO):
                 current_state=obs[self.foothold_cfg["supervision_group"]],
                 dones=dones,
             )
+
+    def _collect_counterfactual_samples(
+        self,
+        previous_observations: TensorDict,
+        actions: torch.Tensor,
+        current_observations: TensorDict,
+        dones: torch.Tensor,
+    ) -> None:
+        """Create safe/collision one-step samples at newly detected touchdowns."""
+        cfg = self.counterfactual_cfg
+        state_group = cfg["state_group"]
+        previous_state = previous_observations[state_group]
+        current_state = current_observations[state_group]
+        previous_contacts = previous_state[:, 12:14] > 0.5
+        current_contacts = current_state[:, 12:14] > 0.5
+        touchdowns = (~previous_contacts) & current_contacts & (~dones.bool()).unsqueeze(-1)
+        touchdowns &= (previous_state[:, 14] > 0.5).unsqueeze(-1)
+        local_size = tuple(cfg["local_size"])
+        resolution = float(cfg["resolution"])
+        rows = round(local_size[0] / resolution)
+        cols = round(local_size[1] / resolution)
+        touchdown_pairs = touchdowns.nonzero(as_tuple=False)
+        if touchdown_pairs.numel() == 0:
+            return
+
+        samples_per_touchdown = int(cfg["samples_per_touchdown"])
+        pair_indices = touchdown_pairs.repeat_interleave(samples_per_touchdown, dim=0)
+        env_indices = pair_indices[:, 0]
+        foot_indices = pair_indices[:, 1]
+        count = env_indices.numel()
+
+        fake_obs = previous_observations[env_indices].clone()
+        fake_actions = actions[env_indices].clone()
+        prev = previous_state[env_indices]
+        cur = current_state[env_indices]
+
+        # Touchdown pose in the robot-local frame at action sampling time.
+        foot_offset = 4 + 4 * foot_indices
+        gather_xy = torch.stack((foot_offset, foot_offset + 1), dim=-1)
+        foot_xy_w = torch.gather(cur, 1, gather_xy)
+        delta = foot_xy_w - prev[:, :2]
+        root_cos, root_sin = prev[:, 2], prev[:, 3]
+        foot_x = root_cos * delta[:, 0] + root_sin * delta[:, 1]
+        foot_y = -root_sin * delta[:, 0] + root_cos * delta[:, 1]
+        foot_cos_w = torch.gather(cur, 1, (foot_offset + 2).unsqueeze(-1)).squeeze(-1)
+        foot_sin_w = torch.gather(cur, 1, (foot_offset + 3).unsqueeze(-1)).squeeze(-1)
+        foot_cos = root_cos * foot_cos_w + root_sin * foot_sin_w
+        foot_sin = root_cos * foot_sin_w - root_sin * foot_cos_w
+        foot_yaw = torch.atan2(foot_sin, foot_cos)
+
+        sample_number = torch.arange(count, device=self.device) % samples_per_touchdown
+        safe_count = round(samples_per_touchdown * float(cfg["safe_fraction"]))
+        is_safe = sample_number < safe_count
+
+        # Foot centre is 3.5 cm ahead of the ankle; its half extents are
+        # 8.5 cm forward/backward and 3 cm laterally.
+        foot_center_x = foot_x + 0.035 * foot_cos
+        foot_center_y = foot_y + 0.035 * foot_sin
+        foot_grid = _rasterize_rectangles(
+            foot_center_x,
+            foot_center_y,
+            foot_yaw,
+            torch.full_like(foot_x, 0.17 + resolution),
+            torch.full_like(foot_x, 0.06 + resolution),
+            local_size,
+            resolution,
+        ).view(count, rows, cols).bool()
+
+        # Every collision sample starts with one grid-aligned region containing
+        # the ankle cell. Safe samples start empty and reserve the whole foot.
+        grid = torch.zeros(count, rows, cols, device=self.device)
+        min_length, max_length = cfg["rectangle_length_range"]
+        min_width, max_width = cfg["rectangle_width_range"]
+        rectangle_rows_range = (round(min_length / resolution), round(max_length / resolution))
+        rectangle_cols_range = (round(min_width / resolution), round(max_width / resolution))
+        collision_height = torch.randint(
+            rectangle_rows_range[0], rectangle_rows_range[1] + 1, (count,), device=self.device
+        )
+        collision_width = torch.randint(
+            rectangle_cols_range[0], rectangle_cols_range[1] + 1, (count,), device=self.device
+        )
+        anchor_row = torch.floor((foot_x + 0.5 * local_size[0]) / resolution).to(torch.long).clamp(0, rows - 1)
+        anchor_col = torch.floor((foot_y + 0.5 * local_size[1]) / resolution).to(torch.long).clamp(0, cols - 1)
+        row_inside = (torch.rand(count, device=self.device) * collision_height).to(torch.long)
+        col_inside = (torch.rand(count, device=self.device) * collision_width).to(torch.long)
+        collision_start_row = (anchor_row - row_inside).clamp(min=0)
+        collision_start_col = (anchor_col - col_inside).clamp(min=0)
+        collision_start_row = torch.minimum(collision_start_row, rows - collision_height)
+        collision_start_col = torch.minimum(collision_start_col, cols - collision_width)
+        row_indices = torch.arange(rows, device=self.device)[None, :, None]
+        col_indices = torch.arange(cols, device=self.device)[None, None, :]
+        collision_region = (
+            (row_indices >= collision_start_row[:, None, None])
+            & (row_indices < (collision_start_row + collision_height)[:, None, None])
+            & (col_indices >= collision_start_col[:, None, None])
+            & (col_indices < (collision_start_col + collision_width)[:, None, None])
+        )
+        grid[~is_safe] = collision_region[~is_safe].to(grid.dtype)
+        grid = _fill_non_overlapping_grid_regions(
+            grid,
+            density_range=tuple(cfg["density_range"]),
+            rectangle_rows_range=rectangle_rows_range,
+            rectangle_cols_range=rectangle_cols_range,
+            forbidden=foot_grid,
+        )
+        # Safe maps start empty and the filler reserves their complete foot
+        # footprint. Collision maps retain the dedicated overlapping region.
+        grid = grid.flatten(start_dim=1)
+        history_length = int(cfg["history_length"])
+        for group in cfg["grid_groups"]:
+            group_obs = fake_obs[group]
+            try:
+                _replace_grid_history(group_obs, grid, history_length)
+            except ValueError as error:
+                raise ValueError(f"Invalid counterfactual observation group '{group}': {error}") from error
+
+        rewards = torch.where(
+            is_safe,
+            torch.full_like(foot_x, float(cfg["safe_reward"])),
+            torch.full_like(foot_x, float(cfg["collision_reward"])),
+        ).unsqueeze(-1)
+        with torch.no_grad():
+            self.policy.act(fake_obs)
+            old_log_prob = self.policy.get_actions_log_prob(fake_actions).unsqueeze(-1)
+            old_mu = self.policy.action_mean.clone()
+            old_sigma = self.policy.action_std.clone()
+            values = self.policy.evaluate(fake_obs)
+            advantages = (rewards - values).clamp(
+                -float(cfg["advantage_clip"]), float(cfg["advantage_clip"])
+            )
+        self._counterfactual_samples.append(
+            {
+                "obs": fake_obs,
+                "actions": fake_actions,
+                "values": values,
+                "advantages": advantages,
+                "returns": rewards,
+                "old_log_prob": old_log_prob,
+                "mu": old_mu,
+                "sigma": old_sigma,
+            }
+        )
 
     def _backfill_foothold_targets(
         self,
@@ -216,6 +451,14 @@ class PPOAMP(PPO):
         mean_disc_demo_score = 0
         mean_foothold_loss = 0 if self.foothold_cfg is not None else None
         foothold_valid_samples = 0
+        counterfactual_pool = None
+        counterfactual_sample_count = 0
+        if self._counterfactual_samples:
+            counterfactual_pool = {
+                key: torch.cat([sample[key] for sample in self._counterfactual_samples], dim=0)
+                for key in self._counterfactual_samples[0]
+            }
+            counterfactual_sample_count = counterfactual_pool["actions"].shape[0]
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -250,6 +493,31 @@ class PPOAMP(PPO):
                 hidden_states_batch,
                 masks_batch,
             ) = samples
+
+            if counterfactual_pool is not None:
+                synthetic_batch_size = max(
+                    1,
+                    round(actions_batch.shape[0] * float(self.counterfactual_cfg["batch_ratio"])),
+                )
+                synthetic_indices = torch.randint(
+                    0, counterfactual_sample_count, (synthetic_batch_size,), device=self.device
+                )
+                obs_batch = torch.cat((obs_batch, counterfactual_pool["obs"][synthetic_indices]), dim=0)
+                actions_batch = torch.cat((actions_batch, counterfactual_pool["actions"][synthetic_indices]), dim=0)
+                target_values_batch = torch.cat(
+                    (target_values_batch, counterfactual_pool["values"][synthetic_indices]), dim=0
+                )
+                advantages_batch = torch.cat(
+                    (advantages_batch, counterfactual_pool["advantages"][synthetic_indices]), dim=0
+                )
+                returns_batch = torch.cat(
+                    (returns_batch, counterfactual_pool["returns"][synthetic_indices]), dim=0
+                )
+                old_actions_log_prob_batch = torch.cat(
+                    (old_actions_log_prob_batch, counterfactual_pool["old_log_prob"][synthetic_indices]), dim=0
+                )
+                old_mu_batch = torch.cat((old_mu_batch, counterfactual_pool["mu"][synthetic_indices]), dim=0)
+                old_sigma_batch = torch.cat((old_sigma_batch, counterfactual_pool["sigma"][synthetic_indices]), dim=0)
             
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -520,6 +788,7 @@ class PPOAMP(PPO):
 
         # Clear the storage
         self.storage.clear()
+        self._counterfactual_samples.clear()
 
         # Construct the loss dictionary
         loss_dict = {
@@ -538,5 +807,7 @@ class PPOAMP(PPO):
         if mean_foothold_loss is not None:
             loss_dict["foothold/loss"] = mean_foothold_loss
             loss_dict["foothold/valid_samples"] = foothold_valid_samples / num_updates
+        if self.counterfactual_cfg is not None:
+            loss_dict["counterfactual/samples"] = counterfactual_sample_count
 
         return loss_dict

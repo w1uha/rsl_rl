@@ -44,7 +44,8 @@ class FootholdLateFusionActor(nn.Module):
             activation,
         )
         self.detach_foothold_prediction = detach_foothold_prediction
-        self.foothold_prediction: torch.Tensor | None = None
+        # Keep this cache tensor-typed so TorchScript can compile assignments in forward().
+        self.foothold_prediction = torch.empty(0)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(observations)
@@ -105,6 +106,6 @@ class ActorCriticFoothold(ActorCritic):
     @property
     def foothold_prediction(self) -> torch.Tensor:
         prediction = self.actor.foothold_prediction
-        if prediction is None:
+        if prediction.numel() == 0:
             raise RuntimeError("Foothold prediction requested before an actor forward pass.")
         return prediction
